@@ -494,10 +494,21 @@ class Experiment:
             script["status"] = "cancelled"
             return self.script_view(script), True, None
 
+    def script_active_locked(self):
+        """active 判定；调用方必须已持有 script_lock。
+
+        script_lock 是不可重入锁：手工 op / readonly 路由需要在**整段执行**
+        持有 script_lock（消除「检查无脚本 → run_op 前恰好装载成功」的
+        TOCTOU 窗口，与 load_script 严格互斥），持锁期间不得再经自取锁的
+        script_active() 重复进入，否则线程自我死锁——请求永不返回、不归还
+        准入名额，进而堵死同实验的脚本查询 / 推进 / 删除等待。
+        """
+        return self.script is not None and self.script["status"] == "active"
+
     def script_active(self):
-        # 手工事务操作与只读切换的准入检查（script_lock 内读标志）
+        # 手工事务操作与只读切换的准入检查（自取 script_lock 读标志）
         with self.script_lock:
-            return self.script is not None and self.script["status"] == "active"
+            return self.script_active_locked()
 
     def checkpoint_state(self):
         # 只读内存缓存：不执行任何 SQL、不触发检查点
@@ -1081,7 +1092,7 @@ def experiment_op(exp_id, side):
             if abs(value) > MAX_ADD_ABS:
                 return jsonify({"error": "value too large"}), 400
         with exp.script_lock:
-            if exp.script_active():
+            if exp.script_active_locked():
                 return (
                     jsonify({"error": "manual operations are locked while a script is active"}),
                     409,
@@ -1107,7 +1118,7 @@ def experiment_set_readonly(exp_id, side):
         # 脚本有效期间只读切换同样锁定（脚本必须沿两栏既定连接语义执行）。
         # 与手工操作一样在整段持 script_lock，避免「检查后、执行前恰好装载」。
         with exp.script_lock:
-            if exp.script_active():
+            if exp.script_active_locked():
                 return (
                     jsonify({"error": "readonly switch is locked while a script is active"}),
                     409,

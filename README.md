@@ -126,9 +126,9 @@ docker compose up --build
 
 访问：<http://localhost:8000>
 
-## 前端交错问题的复现
+## 前端与后端并发问题的复现
 
-修复前有两类前端串扰：
+修复前有三类前端串扰，另有一类后端死锁（手工操作 / 只读切换永久卡住）：
 
 1. **新建期间旧轮询串入新页面**：手动点击「新建实验」时，新的代号
    （`expGen`）立即生效，但旧实验的轮询定时器仍在运行；一次 2 秒轮询恰好在
@@ -144,6 +144,19 @@ docker compose up --build
    请求本身网络失败（或返回非 2xx），旧代码只把复选框机械退回点击前的
    `false`，文案却停留在「开启」；更糟的是之后每次轮询返回的状态 JSON 都与
    已渲染的完全相同，旧的渲染去重直接跳过，矛盾再也无法被相同状态纠正。
+4. **手工操作 / 只读切换死锁并拖垮脚本查询 / 推进 / 删除**：后端为消除
+   「手工 BEGIN 已通过 active 检查、实际执行前恰好装载脚本成功」的窗口，
+   手工 `…/conn/<side>/op` 与 `…/conn/<side>/readonly` 路由在**整段执行**
+   持有实验级 `script_lock`；但锁内复查时又调用了自己再次取同一把
+   （不可重入）锁的 `script_active()`，线程于是自我死锁：
+   - 存活实验**没有有效脚本**时，合法的手工 BEGIN / 读值 / 加法 / 提交 /
+     回滚与只读切换请求全部挂起，永远不返回响应，也不归还删除准入名额
+     （`active_calls`）；
+   - 脚本**有效（active）期间**，本应立即返回 **409** 的手工操作与只读切换
+     同样挂起；
+   - 挂起请求一直占着 `script_lock` 与准入名额，导致同实验的脚本查询
+     （`GET …/script`、`/status` 的 `script` 字段）、推进 / 跳过 / 取消，
+     以及等待在途请求全部完成的 `DELETE` 一并永久阻塞。
 
 ### 浏览器手工复现（修复前行为）
 
@@ -161,6 +174,60 @@ docker compose up --build
 
 修复后：创建期间无任何发往旧 ID 的请求；成功后只启用新 ID 的控件与轮询；
 冻结页新建失败保持冻结并显示错误，手动重试成功才恢复。
+
+#### 后端死锁的手工复现（修复前行为）
+
+1. 新建实验后，在**没有装载脚本**时发起任意手工请求，例如
+   `curl -X POST …/conn/a/op -d '{"op":"begin"}'`：修复前连接挂起、
+   永远不返回（同样挂起的还有 `…/conn/a/readonly` 与另一栏的全部操作）。
+2. 挂起期间再开终端查询脚本 / 状态
+   （`curl …/script`、`curl …/status`），同样永久等待；
+   `curl -X DELETE …/api/experiments/<id>` 也因挂起请求未归还准入名额
+   而无法收尾。
+3. 若先装载脚本，再发起本应被拒绝的手工请求：修复前期望的 **409** 不返回，
+   请求挂起，随后脚本推进 / 跳过 / 取消全部被阻塞。
+
+修复后（接口字段与响应约定全部不变）：
+
+- 无有效脚本时，手工操作与只读切换按原事务规则执行（成功返回
+  `{"ok":true,...}`，业务拒绝仍是 `ok:false` + 拒绝信息，非法字段仍是
+  `400`）；
+- 脚本 active 期间，手工事务操作与只读切换**及时**返回
+  **409** 且**不执行任何 SQL**；查询、已提交值、时间线、检查点不受影响，
+  脚本推进 / 跳过 / 取消照常串行完成；
+- 脚本 `finished` / `cancelled` 后手工操作与只读切换立即恢复，系统
+  **不自动提交也不自动回滚**；
+- 手工 `BEGIN` 与脚本装载严格互斥：BEGIN 先执行则装载 **409**，装载先成功
+  则手工 BEGIN / 只读切换 **409**；只读切换绝不会在脚本有效期内执行；
+- 每个请求结束（含拒绝、异常）都归还准入名额，脚本查询 / 推进 / 删除不再
+  被阻塞。
+
+```bash
+EXP=<新建实验返回的 id>
+BASE=http://localhost:8000/api/experiments/$EXP
+
+# 无脚本：手工 BEGIN 立即返回 200（修复前永久挂起）
+curl -s -X POST $BASE/conn/a/op -H 'Content-Type: application/json' \
+  -d '{"op":"begin"}'
+# 无脚本：只读切换立即返回 200（修复前永久挂起）
+curl -s -X POST $BASE/conn/a/readonly -H 'Content-Type: application/json' \
+  -d '{"enabled":true}'
+curl -s -X POST $BASE/conn/a/op -H 'Content-Type: application/json' \
+  -d '{"op":"rollback"}'
+curl -s -X POST $BASE/conn/a/readonly -H 'Content-Type: application/json' \
+  -d '{"enabled":false}'
+
+# 装载脚本后，手工操作 / 只读切换立即 409（修复前挂起），
+# 脚本查询与推进不受影响
+curl -s -X POST $BASE/script -H 'Content-Type: application/json' \
+  -d '[{"side":"a","op":"read"}]'
+curl -s -o /dev/null -w "%{http_code}\n" -X POST $BASE/conn/a/op \
+  -H 'Content-Type: application/json' -d '{"op":"begin"}'   # 409
+curl -s -o /dev/null -w "%{http_code}\n" -X POST $BASE/conn/b/readonly \
+  -H 'Content-Type: application/json' -d '{"enabled":true}' # 409
+curl -s $BASE/script                                        # 立即返回脚本状态
+# 推进完成后（finished）手工操作恢复，事务不被自动提交 / 回滚
+```
 
 只读开关矛盾的手工复现（DevTools 中用断点 / `fetch` 拦截控制响应顺序）：
 
@@ -232,6 +299,21 @@ SQLite 上驱动脚本状态机：整份校验各分支、装载与手工 BEGIN 
 
 ```bash
 python3 tests/backend_script.py
+```
+
+`tests/backend_routes.py` 用 Flask 测试客户端与真实线程直接驱动**实际路由**
+（真实 `script_lock` / `conn_lock` / 准入门控与真实 SQLite，不另写模拟准入
+逻辑），覆盖手工操作 / 只读切换曾永久卡住的缺陷：无脚本时手工 BEGIN / 只读
+切换按原事务规则正常返回（含重复 BEGIN、SQLITE_READONLY、非布尔 400 等原
+约定）、active 期间两栏全部手工操作与只读切换及时 **409 且不执行**、脚本
+查询 / 推进 / 跳过 / 取消 / 检查点不被阻塞、finished / cancelled 后手工恢复
+且不自动提交 / 回滚、有事务时装载 409、BEGIN 先执行则装载拒绝 / 装载先成功
+则手工拒绝的两种确定性次序与 40 轮真实并发交错（恰一胜、永不并存、无卡死）、
+409 洪泛后准入名额归还使推进 / 查询 / 删除立即完成、DELETE 等待在途手工请求
+且删除开始后新请求一律 410：
+
+```bash
+python3 tests/backend_routes.py
 ```
 
 ## 操作示例
