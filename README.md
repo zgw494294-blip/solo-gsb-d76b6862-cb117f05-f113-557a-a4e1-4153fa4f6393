@@ -105,6 +105,87 @@
   锁定 / 恢复；原有手工接口、检查点、时间线、删除接口与整数无损约定
   全部保留不变
 
+## 手工请求与脚本装载的互斥（后端卡死修复）
+
+手工事务操作（`POST …/conn/<side>/op`）与只读切换
+（`POST …/conn/<side>/readonly`）和脚本装载在同一把实验级 `script_lock`
+上互斥：装载先成功则手工请求 `409`，手工 `BEGIN` 先执行则装载 `409`。
+修复前，这两个路由在持有 `script_lock` 做 active 复查时**再次获取同一把
+非可重入锁**，请求在锁内永久等待自己：
+
+- 存活实验没有有效脚本时，合法 `BEGIN` / 只读切换也不返回；
+- 脚本有效期间本应立即 `409` 的请求同样挂起，且不执行、不归还准入名额；
+- 卡住的请求占住 `script_lock` 与准入名额，随后的脚本查询、推进与删除
+  一并阻塞。
+
+修复后：路由在「复查 + 执行」整段持有 `script_lock`，锁内改用不再重复
+取锁的 `_script_active_locked()` 读标志；请求结束（含 `409`）在
+`finally` 中归还准入名额，脚本查询、推进与删除照常完成。两个接口的字段
+与响应约定不变。
+
+### 复现（修复前）
+
+```bash
+EXP=$(curl -s -X POST http://localhost:8000/api/experiments \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+BASE=http://localhost:8000/api/experiments/$EXP
+
+# 无有效脚本：合法 BEGIN 也不返回（3 秒超时被迫放弃）
+curl -s -m 3 -X POST $BASE/conn/a/op \
+  -H 'Content-Type: application/json' -d '{"op":"begin"}'
+# curl: (28) Operation timed out after 3000 milliseconds
+
+# 只读切换同样挂起
+curl -s -m 3 -X POST $BASE/conn/a/readonly \
+  -H 'Content-Type: application/json' -d '{"enabled":true}'
+# curl: (28) Operation timed out after 3000 milliseconds
+
+# 卡住的请求不归还名额：随后的脚本查询与删除也被阻塞
+curl -s -m 3 $BASE/script     # 超时
+curl -s -m 3 -X DELETE $BASE  # 超时
+```
+
+### 修复后调用
+
+```bash
+EXP=$(curl -s -X POST http://localhost:8000/api/experiments \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+BASE=http://localhost:8000/api/experiments/$EXP
+
+# 无有效脚本：按原事务规则立即执行
+curl -s -X POST $BASE/conn/a/op \
+  -H 'Content-Type: application/json' -d '{"op":"begin"}'
+# {"ok":true,"error":null,"state":{"in_transaction":true,"readonly":false,...}}
+curl -s -X POST $BASE/conn/a/readonly \
+  -H 'Content-Type: application/json' -d '{"enabled":true}'
+# {"ok":true,"error":null,"state":{"in_transaction":true,"readonly":true,...}}
+curl -s -X POST $BASE/conn/a/readonly \
+  -H 'Content-Type: application/json' -d '{"enabled":false}'
+curl -s -X POST $BASE/conn/a/op \
+  -H 'Content-Type: application/json' -d '{"op":"rollback"}'
+
+# 脚本有效期间：及时 409 且不执行；查询 / 取消 / 删除照常
+SID=$(curl -s -X POST $BASE/script -H 'Content-Type: application/json' \
+  -d '[{"side":"a","op":"begin"}]' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["script"]["id"])')
+curl -s -o /dev/null -w "%{http_code}\n" -X POST $BASE/conn/b/op \
+  -H 'Content-Type: application/json' -d '{"op":"begin"}'         # 409
+curl -s -o /dev/null -w "%{http_code}\n" -X POST $BASE/conn/a/readonly \
+  -H 'Content-Type: application/json' -d '{"enabled":true}'       # 409
+curl -s $BASE/script                                              # 200，查询不阻塞
+curl -s -X POST $BASE/script/cancel -H 'Content-Type: application/json' \
+  -d "{\"script_id\":\"$SID\",\"step\":1}"                        # 200，取消后恢复手工
+curl -s -X POST $BASE/conn/b/op \
+  -H 'Content-Type: application/json' -d '{"op":"begin"}'         # 200
+curl -s -X POST $BASE/conn/b/op \
+  -H 'Content-Type: application/json' -d '{"op":"rollback"}'
+curl -s -X DELETE $BASE                                           # {"deleted":true,...}
+```
+
+互斥顺序同样可用 HTTP 复现：手工 `BEGIN` 成功后 `POST …/script` 返回
+`409`；先装载成功则手工 `BEGIN` / 只读切换返回 `409`。回归测试由实际
+路由驱动（含并发交错），见下文「自动化交错测试」。
+
 ## 数值约定
 
 - 存储值为 SQLite 有符号 64 位整数（`-9223372036854775808` ～ `9223372036854775807`），
@@ -228,7 +309,12 @@ node tests/script.test.js
 `tests/backend_script.py` 不依赖 Flask，用最小 stub 导入 `app.py`，在真实
 SQLite 上驱动脚本状态机：整份校验各分支、装载与手工 BEGIN 互斥、写锁冲突后
 失败不回滚 / 重试 / 跳过 / 对方提交后原事务再加法、完成与取消的生命周期、
-过期脚本 ID 与步号的拒绝、取消不自动回滚、有事务时拒绝再装载：
+过期脚本 ID 与步号的拒绝、取消不自动回滚、有事务时拒绝再装载；并用同一
+stub 的最小路由分发**直接驱动实际路由**（真实准入门控与实验级锁，不另写
+模拟准入逻辑）：无有效脚本时手工 BEGIN / 只读切换及时返回、脚本有效期间
+及时 409 且不执行、被拒请求归还名额后查询 / 推进 / 删除不阻塞、完成 /
+取消后恢复手工操作且不自动提交 / 回滚、手工 BEGIN 与装载的并发交错恰好
+一方成功、只读切换绝不在脚本有效期执行：
 
 ```bash
 python3 tests/backend_script.py

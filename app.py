@@ -210,6 +210,10 @@ class Experiment:
         # script_lock 串行化「装载 / 推进 / 跳过 / 取消」与手工操作的
         # active 互斥复查；同实验的脚本动作先在该锁上核对脚本 ID 与步号，
         # 再真实执行，过期请求一律 409，不会触碰到新脚本。
+        # 手工操作 / 只读切换路由在「复查 + 执行」整段持有这把锁，
+        # 锁内读标志只能用 _script_active_locked()——threading.Lock
+        # 不可重入，锁内再次获取会让请求永久卡住，并占住准入名额，
+        # 使随后的脚本查询、推进与删除一并阻塞。
         self.script_lock = threading.Lock()
         self.script = None  # None 或 {id, steps, cursor, records, status}
 
@@ -497,7 +501,14 @@ class Experiment:
     def script_active(self):
         # 手工事务操作与只读切换的准入检查（script_lock 内读标志）
         with self.script_lock:
-            return self.script is not None and self.script["status"] == "active"
+            return self._script_active_locked()
+
+    def _script_active_locked(self):
+        # 调用方必须已持有 script_lock。手工操作 / 只读切换路由在
+        # 「复查 + 执行」整段持有同一把锁（见路由注释），这里绝不能再
+        # 获取：threading.Lock 不可重入，重复获取会让请求永久卡住，
+        # 占住准入名额并阻塞随后的脚本查询、推进与删除。
+        return self.script is not None and self.script["status"] == "active"
 
     def checkpoint_state(self):
         # 只读内存缓存：不执行任何 SQL、不触发检查点
@@ -1072,7 +1083,8 @@ def experiment_op(exp_id, side):
         # TOCTOU 窗口——手工 BEGIN 实际执行前，另一线程可能已装载脚本成功
         # （装载在同一把锁内复查两栏无事务），从而破坏「有事务不能装载」
         # 不变量。锁序 script_lock → conn_lock（run_op 内部）与 load_script
-        # 完全一致，不构成死锁环。
+        # 完全一致，不构成死锁环。锁内读标志只能用 _script_active_locked()：
+        # script_lock 不可重入，重复获取会让请求永久卡住并占住准入名额。
         value = None
         if op == "add":
             value = parse_int(data.get("value"))
@@ -1081,7 +1093,7 @@ def experiment_op(exp_id, side):
             if abs(value) > MAX_ADD_ABS:
                 return jsonify({"error": "value too large"}), 400
         with exp.script_lock:
-            if exp.script_active():
+            if exp._script_active_locked():
                 return (
                     jsonify({"error": "manual operations are locked while a script is active"}),
                     409,
@@ -1105,9 +1117,10 @@ def experiment_set_readonly(exp_id, side):
         if not isinstance(data, dict) or not isinstance(data.get("enabled"), bool):
             return jsonify({"error": "enabled must be a boolean"}), 400
         # 脚本有效期间只读切换同样锁定（脚本必须沿两栏既定连接语义执行）。
-        # 与手工操作一样在整段持 script_lock，避免「检查后、执行前恰好装载」。
+        # 与手工操作一样在整段持 script_lock，避免「检查后、执行前恰好装载」；
+        # 锁内同样只能用不重复取锁的 _script_active_locked() 读标志。
         with exp.script_lock:
-            if exp.script_active():
+            if exp._script_active_locked():
                 return (
                     jsonify({"error": "readonly switch is locked while a script is active"}),
                     409,
