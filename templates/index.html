@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SQLite 事务隔离实验室</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header>
+    <h1>SQLite 事务隔离实验室<small>WAL 模式 · BEGIN DEFERRED · 单行整数值 100</small></h1>
+    <div class="exp-bar">
+      <span>实验 ID：<code id="exp-id">…</code></span>
+      <button id="new-exp" type="button">新建实验</button>
+      <button id="delete-exp" class="danger" type="button">删除当前实验</button>
+      <span class="spacer"></span>
+      <span>已提交值（第三条连接）：<strong id="committed" class="committed-value">…</strong></span>
+      <button id="refresh-committed" type="button">刷新</button>
+    </div>
+    <div class="error-box deleted-note" id="deleted-note" hidden></div>
+    <div class="error-box" id="error-exp" hidden></div>
+  </header>
+
+  <main>
+    <section class="panel" id="panel-a">
+      <h2>连接甲（A）</h2>
+      <div class="status-line">
+        <span class="dot" id="dot-a"></span>
+        <span>事务：<b id="tx-a">…</b></span>
+        <span>只读（PRAGMA query_only）：<b id="ro-a" class="ro-state">…</b></span>
+        <span>最近一次显式读值：<b id="read-a" class="read-value">—</b></span>
+      </div>
+      <div class="controls">
+        <button type="button" data-op="begin">BEGIN DEFERRED</button>
+        <button type="button" data-op="read">读值</button>
+        <span class="add-group">
+          <input type="text" inputmode="numeric" pattern="[+-]?[0-9]+" value="10" id="add-input-a" aria-label="要加上的整数" autocomplete="off">
+          <button type="button" data-op="add">加上</button>
+        </span>
+        <button type="button" data-op="commit">提交</button>
+        <button type="button" data-op="rollback">回滚</button>
+        <label class="ro-toggle" title="在本栏原长期连接上真实执行 PRAGMA query_only：不换连接、不结束事务；开启后写语句由 SQLite 返回 SQLITE_READONLY(8)，提交/回滚不重置">
+          <input type="checkbox" id="ro-toggle-a"> 只读开关
+        </label>
+      </div>
+      <div class="error-box" id="error-a" hidden></div>
+      <ol class="log" id="log-a"></ol>
+    </section>
+
+    <section class="panel" id="panel-b">
+      <h2>连接乙（B）</h2>
+      <div class="status-line">
+        <span class="dot" id="dot-b"></span>
+        <span>事务：<b id="tx-b">…</b></span>
+        <span>只读（PRAGMA query_only）：<b id="ro-b" class="ro-state">…</b></span>
+        <span>最近一次显式读值：<b id="read-b" class="read-value">—</b></span>
+      </div>
+      <div class="controls">
+        <button type="button" data-op="begin">BEGIN DEFERRED</button>
+        <button type="button" data-op="read">读值</button>
+        <span class="add-group">
+          <input type="text" inputmode="numeric" pattern="[+-]?[0-9]+" value="10" id="add-input-b" aria-label="要加上的整数" autocomplete="off">
+          <button type="button" data-op="add">加上</button>
+        </span>
+        <button type="button" data-op="commit">提交</button>
+        <button type="button" data-op="rollback">回滚</button>
+        <label class="ro-toggle" title="在本栏原长期连接上真实执行 PRAGMA query_only：不换连接、不结束事务；开启后写语句由 SQLite 返回 SQLITE_READONLY(8)，提交/回滚不重置">
+          <input type="checkbox" id="ro-toggle-b"> 只读开关
+        </label>
+      </div>
+      <div class="error-box" id="error-b" hidden></div>
+      <ol class="log" id="log-b"></ol>
+    </section>
+  </main>
+
+  <section class="script" id="script">
+    <h2>脚本逐步执行（两栏共用一份脚本 · 步号从 1 开始）</h2>
+    <p class="script-hint">粘贴 1～50 步的 JSON 数组，每步含 <code>side</code>（"a"/"b"）与
+       <code>op</code>（begin / read / add / commit / rollback），add 另含
+       <code>value</code>（整数，沿用 ±2⁶² 上限与大整数无损）。仅当<b>两栏均无事务</b>
+       且没有有效脚本时才能装载；装载后两栏手工事务操作与只读开关由后端锁定，
+       查询、检查点、删除仍可用。「推进一步」在该栏<b>原长期连接</b>真实执行：
+       成功才前移；失败不代为回滚，停在原步，可重试或跳过。完成或取消后恢复手工操作，
+       系统不自动提交 / 回滚。推进 / 跳过 / 取消均携带脚本 ID 与所见步号，
+       过期请求不会执行、也不影响新脚本。</p>
+    <div class="controls">
+      <textarea id="script-input" rows="5" spellcheck="false"
+        placeholder='[{"side":"b","op":"begin"},{"side":"b","op":"add","value":7}]'></textarea>
+    </div>
+    <div class="controls">
+      <button type="button" id="script-load">装载脚本</button>
+      <button type="button" id="script-example">填入：乙写锁跳过示例</button>
+      <button type="button" id="script-advance">推进一步</button>
+      <button type="button" id="script-skip">跳过本步</button>
+      <button type="button" class="danger" id="script-cancel">取消脚本</button>
+    </div>
+    <div class="error-box" id="error-script" hidden></div>
+    <div class="script-state" id="script-state">尚未装载脚本</div>
+    <ol class="log script-log" id="script-records"></ol>
+  </section>
+
+  <section class="checkpoint" id="checkpoint">
+    <h2>WAL 检查点（独立连接真实执行 <code>PRAGMA wal_checkpoint</code>，busy_timeout=0）</h2>
+    <div class="controls">
+      <button type="button" id="ckpt-passive">PASSIVE 检查点</button>
+      <button type="button" id="ckpt-truncate">TRUNCATE 检查点</button>
+      <span class="ckpt-result" id="ckpt-result">尚未执行过检查点</span>
+    </div>
+    <div class="error-box" id="error-ckpt" hidden></div>
+    <p class="ckpt-hint">各写连接已关闭自动检查点（<code>PRAGMA wal_autocheckpoint=0</code>）；
+       检查点每次使用全新的独立连接，不代替甲、乙提交 / 回滚，也不替换连接。
+       返回 SQLite 原始三项：<b>busy</b>、<b>WAL 总帧数</b>、<b>已回写帧数</b>，
+       以及操作后 WAL 文件字节数（文件不存在记 0）。读事务未结束时，PASSIVE
+       回写未完成（已回写帧数为 0），TRUNCATE 立即返回 busy=1。</p>
+    <ol class="log" id="log-ckpt"></ol>
+  </section>
+
+  <section class="timeline" id="timeline">
+    <h2>提交时间线（按事务汇总 · 按实际提交顺序从 1 编号）</h2>
+    <p class="timeline-hint">仅「至少一次加法成功且 COMMIT 成功」的事务产生一条记录：
+       栏位、首次成功加法前的值、提交后的值与按执行顺序排列的成功增量（整数无损）。
+       失败加法不计入；回滚、失败提交与纯读事务不记录；未提交内容不可见；
+       提交重试成功只记一次。记录来自事务执行期间的内存捕获，查询与轮询不在
+       两栏连接上额外读值、不提前建立快照；时间线只保存在内存，无需跨重启保留。</p>
+    <ol class="log timeline-log" id="timeline-list"></ol>
+  </section>
+
+  <footer>
+    <p>说明：状态刷新不执行任何 SELECT，不会为 DEFERRED 事务提前建立快照，也不触发检查点
+       （检查点结果只读内存缓存）；写锁冲突会立即返回
+       SQLite 错误名与错误码，不阻塞另一栏，也不会自动结束失败的事务；修改操作只允许在事务内进行。
+       每栏只读开关在<b>本栏原连接</b>上真实执行 <code>PRAGMA query_only</code>，
+       不换连接、不结束事务、不建立快照；开启后加法由 SQLite 返回 SQLITE_READONLY(8)，
+       读值 / 提交 / 回滚照常，提交 / 回滚不重置开关。</p>
+  </footer>
+
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
